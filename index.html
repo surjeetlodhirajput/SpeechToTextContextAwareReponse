@@ -1,0 +1,218 @@
+<!-- index.html -->
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebRTC Voice Assistant</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; text-align: center; background-color: #f4f4f4; }
+        #controls { margin-top: 20px; }
+        button { padding: 10px 20px; font-size: 16px; margin: 5px; cursor: pointer; border: none; border-radius: 5px; background-color: #007bff; color: white; }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        #status { margin-top: 20px; font-size: 1.1em; color: #333; }
+        #messages { margin-top: 30px; text-align: left; max-width: 600px; margin-left: auto; margin-right: auto; padding: 15px; border: 1px solid #ddd; border-radius: 8px; background-color: white; min-height: 100px; max-height: 300px; overflow-y: auto; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .message { margin-bottom: 10px; padding: 8px 12px; border-radius: 5px; }
+        .user-message { background-color: #e6f7ff; text-align: right; }
+        .assistant-message { background-color: #e6ffe6; text-align: left; }
+    </style>
+</head>
+<body>
+    <h1>WebRTC Voice Assistant</h1>
+
+    <div id="controls">
+        <button id="startButton">Start Session</button>
+        <button id="stopButton" disabled>Stop Session</button>
+    </div>
+
+    <p id="status">Click "Start Session" to begin.</p>
+
+    <div id="messages">
+        <!-- Messages will appear here -->
+    </div>
+
+    <audio id="remoteAudio" autoplay></audio>
+
+    <script>
+        const WEBRTC_SERVER_URL = "http://localhost:8001"; 
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const statusDisplay = document.getElementById('status');
+        const messagesDisplay = document.getElementById('messages');
+        const remoteAudio = document.getElementById('remoteAudio');
+
+        let peerConnection = null;
+        let localStream = null;
+        let sessionId = null;
+        let isSessionActive = false;
+        const iceCandidatesQueue = []; // Queue for ICE candidates if sessionId isn't ready
+
+        function addMessage(sender, text) {
+            const msgDiv = document.createElement('div');
+            msgDiv.classList.add('message');
+            msgDiv.classList.add(sender === 'user' ? 'user-message' : 'assistant-message');
+            msgDiv.textContent = `${sender === 'user' ? 'You' : 'Assistant'}: ${text}`;
+            messagesDisplay.appendChild(msgDiv);
+            messagesDisplay.scrollTop = messagesDisplay.scrollHeight; 
+        }
+
+        async function sendIceCandidateToServer(candidate, currentSessionId) {
+            // This function is now only called by flushIceCandidatesQueue
+            // which guarantees sessionId is available.
+            try {
+                const candidatePayload = {
+                    candidate: candidate.candidate,
+                    sdpMid: candidate.sdpMid,
+                    sdpMLineIndex: candidate.sdpMLineIndex
+                };
+                await fetch(`${WEBRTC_SERVER_URL}/candidate/${currentSessionId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(candidatePayload)
+                });
+                console.log('Client: Successfully sent ICE candidate:', candidatePayload.candidate);
+            } catch (e) {
+                console.error('Client: Error sending ICE candidate:', e);
+            }
+        }
+
+        async function flushIceCandidatesQueue() {
+            console.log('Client: Flushing ICE candidates queue.');
+            while (iceCandidatesQueue.length > 0 && sessionId) {
+                const candidate = iceCandidatesQueue.shift();
+                await sendIceCandidateToServer(candidate, sessionId);
+            }
+        }
+
+
+        async function startSession() {
+            statusDisplay.textContent = 'Starting session...';
+            startButton.disabled = true;
+            stopButton.disabled = false;
+            messagesDisplay.innerHTML = ''; 
+            addMessage('assistant', 'Session started. Please allow microphone access.');
+            sessionId = null; // Reset sessionId for a new session
+            iceCandidatesQueue.length = 0; // Clear queue for new session
+
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                addMessage('assistant', 'Microphone access granted. Establishing WebRTC connection...');
+                
+                peerConnection = new RTCPeerConnection({
+                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] 
+                });
+
+                localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+                // CORRECTED: Directly queue ICE candidates
+                peerConnection.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        console.log('Client: Local ICE candidate generated (queued):', event.candidate);
+                        iceCandidatesQueue.push(event.candidate); 
+                    }
+                };
+
+                peerConnection.ontrack = (event) => {
+                    console.log('Client: Remote track received:', event.track.kind);
+                    if (event.track.kind === 'audio') {
+                        remoteAudio.srcObject = event.streams[0]; 
+                    }
+                };
+
+                peerConnection.onconnectionstatechange = () => {
+                    console.log('Client: Connection state changed:', peerConnection.connectionState);
+                    statusDisplay.textContent = `Connection state: ${peerConnection.connectionState}`;
+                    if (peerConnection.connectionState === 'failed' || peerConnection.connectionState === 'closed') {
+                        if (isSessionActive) { 
+                            addMessage('assistant', `Connection ${peerConnection.connectionState}. Please restart.`);
+                        }
+                        stopSession(); 
+                    }
+                };
+
+                peerConnection.oniceconnectionstatechange = () => {
+                    console.log('Client: ICE connection state changed:', peerConnection.iceConnectionState);
+                    statusDisplay.textContent = `ICE connection state: ${peerConnection.iceConnectionState}`;
+                };
+
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+
+                const response = await fetch(`${WEBRTC_SERVER_URL}/offer`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sdp: peerConnection.localDescription.sdp,
+                        type: peerConnection.localDescription.type
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Server returned status ${response.status}`);
+                }
+                const data = await response.json();
+                sessionId = data.session_id; // Get the session_id from the server
+                console.log('Client: Received SDP answer from server, session ID:', sessionId);
+                addMessage('assistant', 'WebRTC connection established. You can now speak!');
+
+                const remoteDesc = new RTCSessionDescription({
+                    sdp: data.sdp,
+                    type: data.type
+                });
+                await peerConnection.setRemoteDescription(remoteDesc);
+                isSessionActive = true;
+                statusDisplay.textContent = 'WebRTC Connected. Speak now!';
+                
+                // Add server's ICE candidates received in the offer response
+                if (data.server_ice_candidates && Array.isArray(data.server_ice_candidates)) {
+                    for (const candidatePayload of data.server_ice_candidates) {
+                        try {
+                            // RTCIceCandidate constructor can take an object directly
+                            const remoteCandidate = new RTCIceCandidate(candidatePayload);
+                            await peerConnection.addIceCandidate(remoteCandidate);
+                            console.log('Client: Added server ICE candidate:', remoteCandidate.candidate);
+                        } catch (e) {
+                            console.error('Client: Error adding server ICE candidate:', e);
+                        }
+                    }
+                }
+
+                // CORRECTED: Flush any queued ICE candidates ONLY AFTER sessionId is available and remote description is set
+                await flushIceCandidatesQueue();
+
+            } catch (error) {
+                console.error('Client: Error starting WebRTC session:', error);
+                statusDisplay.textContent = `Error: ${error.message}. Check console for details.`;
+                addMessage('assistant', `Failed to start session: ${error.message}.`);
+                stopSession();
+            }
+        }
+
+        function stopSession() {
+            statusDisplay.textContent = 'Session ending...';
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            isSessionActive = false;
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            sessionId = null; 
+            iceCandidatesQueue.length = 0; 
+            statusDisplay.textContent = 'Session ended. Click "Start Session" to begin again.';
+            addMessage('assistant', 'Session ended.');
+        }
+
+        startButton.addEventListener('click', startSession);
+        stopButton.addEventListener('click', stopSession);
+
+        window.peerConnection = peerConnection;
+        window.localStream = localStream;
+
+    </script>
+</body>
+</html>
