@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import string
 import threading
 import time
 import uuid
@@ -22,7 +21,6 @@ from pydantic import BaseModel
 from scipy.signal import resample
 import soundfile as sf
 from gtts import gTTS
-from fractions import Fraction
 import fractions
 
 # --- Logging ---
@@ -36,14 +34,14 @@ WEBRTC_SERVER_PORT = 8001
 # --- Globals ---
 pcs = set()
 pcs_by_id: Dict[str, RTCPeerConnection] = {}
-tts_engines: Dict[str, pyttsx3.Engine] = {}
 tts_queue = queue.Queue()
 audio_output_queues: Dict[str, queue.Queue] = {}
 pc_outbound_send_ttrack: Dict[str, "OutboundAudioTrack"] = {}
 audio_buffers: Dict[str, bytearray] = {}
 silent_chunk_counts: Dict[str, int] = {}
-server_ice_candidates: Dict[str, List["RTCIceCandidateJSON"]] = {}
-current_wav_file: Dict[str, wave.Wave_write] = {}
+server_ice_candidates: Dict[str, List] = {}
+
+# Recording manager globals (managed by class)
 # Audio config
 WHISPER_SAMPLE_RATE = 16000
 WHISPER_CHANNELS = 1
@@ -51,26 +49,28 @@ WHISPER_DTYPE = np.float32
 
 WEBRTC_SAMPLE_RATE = 48000
 WEBRTC_CHANNELS = 1
-WEBRTC_FRAME_DURATION = 0.02 #20 ms frame duration
+WEBRTC_FRAME_DURATION = 0.02  # 20 ms frame duration
 
-WEBRTC_AUDIO_CHUNK_SIZE = WHISPER_SAMPLE_RATE // 2
+# RMS threshold for silence detection
 SILENCE_THRESHOLD_RMS = 0.015
-CONSECUTIVE_SILENT_CHUNKS = 3
-FRAME_MS = 20
-FRAME_SIZE = int(WHISPER_SAMPLE_RATE * (FRAME_MS / 1000.0))
 
+# VAD: 5 seconds of silence => number of 20ms frames
+SILENCE_SECONDS = 5.0
+FRAMES_PER_SECOND = int(1.0 / WEBRTC_FRAME_DURATION)  # 50
+CONSECUTIVE_SILENT_FRAMES_TO_ROTATE = int(SILENCE_SECONDS * FRAMES_PER_SECOND)
+
+# Minimum length for upload (>=2s)
+MIN_UPLOAD_SECONDS = 2.0
 
 # --- Models ---
 class Offer(BaseModel):
     sdp: str
     type: str
 
-
 class RTCIceCandidateJSON(BaseModel):
     candidate: str
     sdpMid: str = None
     sdpMLineIndex: int = None
-
 
 # --- FastAPI app ---
 app = FastAPI()
@@ -82,25 +82,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ------------- TTS worker (pyttsx3) - same pattern as before ----------------
 def create_tts_engine():
-    """create the tts engine instance"""
     engine = pyttsx3.init()
-    engine.setProperty("rate",180)
+    engine.setProperty("rate", 180)
     return engine
-# --- pyttsx3 TTS Worker (thread) ---
+
 def tts_engine_worker():
     logger.info("TTS Engine worker started.")
     engine = None
     while True:
-        logger.info("engine started for the next teask")
         task = tts_queue.get()
-        logger.info(f"tts engine Get Task {task}")
+        if task is None:
+            logger.info("TTS worker shutdown signal received.")
+            tts_queue.task_done()
+            if engine:
+                try:
+                    engine.stop()
+                except:
+                    pass
+            break
 
         session_id = task["session_id"]
         text = task["text"]
         temp_file_name = f"tts_uuid_{uuid.uuid4()}.wav"
         try:
-            logger.info(f"TTS Engined creating fresg engine for the session {session_id}")
             if engine:
                 try:
                     engine.stop()
@@ -108,13 +114,13 @@ def tts_engine_worker():
                     pass
             engine = create_tts_engine()
             engine.save_to_file(text, temp_file_name)
-            import threading
+
             def run_tts():
                 engine.runAndWait()
-            tts_thread = threading.Thread(target = run_tts)
-            tts_thread.daemon = True
+
+            tts_thread = threading.Thread(target=run_tts, daemon=True)
             tts_thread.start()
-            tts_thread.join(timeout=10)#10second time out
+            tts_thread.join(timeout=10)
 
             if tts_thread.is_alive():
                 try:
@@ -122,46 +128,39 @@ def tts_engine_worker():
                 except:
                     pass
                 continue
+
             if not os.path.exists(temp_file_name):
                 continue
-            with wave.open(temp_file_name,'rb') as wf:
+
+            with wave.open(temp_file_name, 'rb') as wf:
                 orig_rate = wf.getframerate()
                 channels = wf.getnchannels()
                 nframes = wf.getnframes()
-
-                logger.info(f"TTS: Worket Audio file state:- Rate {orig_rate}, Channels: {channels} Frame: {nframes}")
                 pcm_data = wf.readframes(nframes)
-                audio = np.frombuffer(pcm_data, dtype = np.int16)
+                audio = np.frombuffer(pcm_data, dtype=np.int16)
                 if channels == 2:
-                    audio = audio.reshape(-1,2).mean(axis=1) # convert stereo to mono
+                    audio = audio.reshape(-1, 2).mean(axis=1)
                 if orig_rate != WEBRTC_SAMPLE_RATE:
-                    num_samples = int(len(audio)* WEBRTC_SAMPLE_RATE/orig_rate)
+                    num_samples = int(len(audio) * WEBRTC_SAMPLE_RATE / orig_rate)
                     audio = resample(audio, num_samples)
-                audio = audio.astype(np.float32) / (2**15)
+                audio = audio.astype(np.float32) / (2 ** 15)
 
-                chunk_size = int(WEBRTC_SAMPLE_RATE * WEBRTC_FRAME_DURATION) #20 ms chunks
-                chunk_sent = 0  
-                logger.info(f"TTS: Worker: Starting to streo {len(audio)} samples in chunks of {chunk_size}")
-
+                chunk_size = int(WEBRTC_SAMPLE_RATE * WEBRTC_FRAME_DURATION)
                 for i in range(0, len(audio), chunk_size):
                     chunk = audio[i:i+chunk_size]
                     if session_id in audio_output_queues:
                         audio_output_queues[session_id].put(chunk)
-                        chunk_sent+=1
-                        print("chunk pushed into the array")
-                    time.sleep(WEBRTC_FRAME_DURATION)
-                
-                if session_id in audio_output_queues:
-                    logger.info(f"Finished for streaming session id{session_id}")
-
-            if os.path.exists(temp_file_name):
-                os.remove(temp_file_name)
+                        # sleep to emulate realtime
+                        time.sleep(WEBRTC_FRAME_DURATION)
         except Exception as e:
-            logger.error(f"error in the file conversion {e}")
-            if os.path.exists(temp_file_name):
-                os.remove(temp_file_name)
+            logger.exception("TTS worker error: %s", e)
         finally:
             tts_queue.task_done()
+            if os.path.exists(temp_file_name):
+                try:
+                    os.remove(temp_file_name)
+                except:
+                    pass
             if engine:
                 try:
                     engine.stop()
@@ -169,43 +168,227 @@ def tts_engine_worker():
                     pass
             engine = None
 
-
 tts_worker_thread = threading.Thread(target=tts_engine_worker, daemon=True)
 tts_worker_thread.start()
 
-
-# --- Utility: PCM normalization ---
-def _ensure_mono_int16_16k(samples: np.ndarray, sr: int) -> np.ndarray:
-    if samples.ndim > 1:
-        samples = samples.mean(axis=-1)
-    if samples.dtype in (np.float32, np.float64):
-        samples = np.clip(samples, -1.0, 1.0)
-        samples = (samples * 32768.0).astype(np.int16)
-    elif samples.dtype != np.int16:
-        samples = samples.astype(np.int16)
-    if sr != WHISPER_SAMPLE_RATE:
-        num_samples = int(round(len(samples) * WHISPER_SAMPLE_RATE / sr))
-        f = samples.astype(np.float32)
-        x_old = np.linspace(0, 1, len(f), endpoint=False)
-        x_new = np.linspace(0, 1, num_samples, endpoint=False)
-        samples = np.interp(x_new, x_old, f).astype(np.int16)
-    return samples
+# ---------------- Utility helpers ----------------
+def convert_48khz_audio_to_16khz(samples_48k: np.ndarray) -> np.ndarray:
+    """Simple downsample by picking every 3rd sample (48k -> 16k).
+       Input expected in float32 normalized [-1,1]. Returns int16."""
+    if samples_48k.ndim > 1:
+        samples_48k = samples_48k.mean(axis=-1)
+    # decimate by 3
+    samples_16k = samples_48k[::5]
+    samples_16k = np.clip(samples_16k, -1.0, 1.0)
+    return (samples_16k * 32767.0).astype(np.int16)
 
 
-def text_to_pcm_array(text: str) -> np.ndarray:
-    tts = gTTS(text=text, lang="en")
-    buf = io.BytesIO()
-    tts.write_to_fp(buf)
-    buf.seek(0)
-    data, sr = sf.read(buf, always_2d=False)
-    return _ensure_mono_int16_16k(data, sr)
+def float_samples_to_int16(samples: np.ndarray) -> np.ndarray:
+    samples = np.clip(samples, -1.0, 1.0)
+    return (samples * 32767.0).astype(np.int16)
+
+# ---------------- Recording Manager ----------------
+class RecordingManager:
+    """
+    Manages per-session wave file, writing samples, deciding when to finalize/upload.
+    Thread-safe operations using a lock per session.
+    """
+    def __init__(self, recordings_dir="recordings"):
+        self.recordings_dir = recordings_dir
+        os.makedirs(self.recordings_dir, exist_ok=True)
+        self.lock = threading.Lock()
+        # maps session_id -> dict with file handle and metadata
+        self.sessions: Dict[str, Dict] = {}
+
+    def ensure_session(self, session_id: str):
+        with self.lock:
+            if session_id not in self.sessions:
+                filename = self._new_filename(session_id)
+                wf = wave.open(filename, 'wb')
+                wf.setnchannels(WHISPER_CHANNELS)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(WHISPER_SAMPLE_RATE)
+                self.sessions[session_id] = {
+                    "wave": wf,
+                    "filename": filename,
+                    "created_at": time.time(),
+                    "frames_written": 0,  # number of int16 samples written (per channel)
+                    "silent_frames": 0,  # consecutive silent 20ms frames
+                }
+                logger.info("RecordingManager: Created new wav %s for %s", filename, session_id)
+            return self.sessions[session_id]
+
+    def _new_filename(self, session_id: str) -> str:
+        ts = int(time.time())
+        unique = uuid.uuid4().hex[:8]
+        return os.path.join(self.recordings_dir, f"rc_{session_id}_{ts}_{unique}.wav")
+
+    def write_samples(self, session_id: str, audio_int16: np.ndarray):
+        """
+        audio_int16: int16 numpy array (mono) at 16k sample rate.
+        """
+        sess = self.ensure_session(session_id)
+        wf = sess["wave"]
+        # write bytes
+        try:
+            wf.writeframes(audio_int16.tobytes())
+            sess["frames_written"] += len(audio_int16)
+        except Exception:
+            logger.exception("RecordingManager: Error writing samples for %s", session_id)
+
+    def get_duration_seconds(self, session_id: str) -> float:
+        sess = self.sessions.get(session_id)
+        if not sess:
+            return 0.0
+        frames = sess["frames_written"]
+        return frames / float(WHISPER_SAMPLE_RATE)
+
+    def mark_speech(self, session_id: str):
+        """
+        Reset silent counter on speech frame.
+        """
+        sess = self.ensure_session(session_id)
+        sess["silent_frames"] = 0
+
+    def mark_silence_and_maybe_rotate(self, session_id: str) -> bool:
+        """
+        Increment silent frame counter. If counter reaches threshold,
+        decide whether to finalize/upload and create a new file.
+        Returns True if rotation (new file created) happened, else False.
+        """
+        sess = self.ensure_session(session_id)
+        sess["silent_frames"] += 1
+        if sess["silent_frames"] >= CONSECUTIVE_SILENT_FRAMES_TO_ROTATE:
+            # check duration
+            duration = self.get_duration_seconds(session_id)
+            filename = sess["filename"]
+            logger.info("RecordingManager: Detected %d silent frames for %s (duration %.2fs).",
+                        sess["silent_frames"], session_id, duration)
+            if duration >= MIN_UPLOAD_SECONDS:
+                # finalize current file and upload
+                logger.info("RecordingManager: Finalizing and uploading %s (%.2fs) for %s",
+                            filename, duration, session_id)
+                self._close_session_wave(session_id)  # close handle before upload
+                # upload in background thread
+                t = threading.Thread(target=self._upload_and_delete, args=(session_id, filename), daemon=True)
+                t.start()
+                # create new file for next segment
+                self._create_new_session_wave(session_id)
+                return True
+            else:
+                # If file shorter than MIN_UPLOAD_SECONDS -> keep writing to same file (do not rotate)
+                logger.info("RecordingManager: File %s for %s is < %.1fs, will continue writing to it.",
+                            filename, session_id, MIN_UPLOAD_SECONDS)
+                # reset silent counter so we don't repeatedly log
+                sess["silent_frames"] = 0
+                return False
+        return False
+
+    def _create_new_session_wave(self, session_id: str):
+        with self.lock:
+            # create new file replacing session
+            filename = self._new_filename(session_id)
+            try:
+                wf = wave.open(filename, 'wb')
+                wf.setnchannels(WHISPER_CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(WHISPER_SAMPLE_RATE)
+                self.sessions[session_id] = {
+                    "wave": wf,
+                    "filename": filename,
+                    "created_at": time.time(),
+                    "frames_written": 0,
+                    "silent_frames": 0,
+                }
+                logger.info("RecordingManager: Created rotated wav %s for %s", filename, session_id)
+            except Exception:
+                logger.exception("RecordingManager: Error creating rotated wav for %s", session_id)
+
+    def _close_session_wave(self, session_id: str):
+        with self.lock:
+            sess = self.sessions.get(session_id)
+            if sess:
+                wf = sess.get("wave")
+                if wf:
+                    try:
+                        wf.close()
+                    except:
+                        logger.exception("RecordingManager: Error closing wave for %s", session_id)
+
+    def finalize_and_upload_on_close(self, session_id: str):
+        """
+        Called when session ends. Ensure current file closed and uploaded.
+        """
+        with self.lock:
+            sess = self.sessions.get(session_id)
+            if not sess:
+                return
+            filename = sess["filename"]
+            # close wave
+            try:
+                sess["wave"].close()
+            except:
+                logger.exception("RecordingManager: Error closing final wave for %s", session_id)
+            # remove session entry
+            del self.sessions[session_id]
+        # Upload final file in background
+        logger.info("RecordingManager: Finalizing session %s -> uploading %s", session_id, filename)
+        t = threading.Thread(target=self._upload_and_delete, args=(session_id, filename), daemon=True)
+        t.start()
+
+    def _upload_and_delete(self, session_id: str, filename: str):
+        """
+        Upload file to MAIN_FASTAPI_SERVER_URL /upload_wav.
+        Delete only after successful upload.
+        """
+        try:
+            if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+                logger.warning("RecordingManager: Upload skipped because file missing/empty: %s", filename)
+                return
+            # double check duration on disk (more robust)
+            try:
+                with wave.open(filename, 'rb') as wf:
+                    frames = wf.getnframes()
+                    rate = wf.getframerate()
+                    duration = frames / float(rate)
+            except Exception:
+                duration = 0.0
+
+            if duration < MIN_UPLOAD_SECONDS:
+                logger.info("RecordingManager: Upload skipped because duration %.2fs < %.2fs for %s",
+                            duration, MIN_UPLOAD_SECONDS, filename)
+                # If file is too short, keep file on disk (no deletion). This ensures caller can append later
+                return
+
+            with open(filename, 'rb') as f:
+                files = {'file': (os.path.basename(filename), f, 'audio/wav')}
+                data = {
+                    'session_id': session_id,
+                    'callback_url': f"http://localhost:{WEBRTC_SERVER_PORT}/webrtc_server_callback"
+                }
+                logger.info("RecordingManager: Uploading %s for session %s", filename, session_id)
+                resp = requests.post(f"{MAIN_FASTAPI_SERVER_URL}/upload_wav", files=files, data=data, timeout=30)
+                resp.raise_for_status()
+                logger.info("RecordingManager: Upload succeeded for %s, response: %s", filename, resp.text)
+            # delete only after success
+            try:
+                os.remove(filename)
+                logger.info("RecordingManager: Deleted local file %s after upload", filename)
+            except OSError:
+                logger.exception("RecordingManager: Error deleting local file %s", filename)
+        except requests.exceptions.RequestException as e:
+            logger.exception("RecordingManager: Upload failed for %s: %s", filename, e)
+        except Exception:
+            logger.exception("RecordingManager: Unexpected error while uploading %s", filename)
 
 
-# --- Outbound track ---
+recording_manager = RecordingManager()
+
+# ---------------- Outbound audio track (server->client TTS streaming) ----------------
 class WebRTCAudioSenderTrack(AudioStreamTrack):
     kind = "audio"
 
-    def __init__(self, session_id: string):
+    def __init__(self, session_id: str):
         super().__init__()
         self.session_id = session_id
         self.queue = audio_output_queues.get(session_id)
@@ -219,27 +402,25 @@ class WebRTCAudioSenderTrack(AudioStreamTrack):
     async def recv(self) -> AudioFrame:
         try:
             try:
-                chunk = await asyncio.wait_for(asyncio.to_thread(self.queue.get, timeout = 0.1),
-                timeout = 0.1)
-            except(asyncio.TimeoutError, queue.Empty):
+                chunk = await asyncio.wait_for(asyncio.to_thread(self.queue.get, timeout=0.1), timeout=0.1)
+            except (asyncio.TimeoutError, queue.Empty):
                 silence_samples = int(WEBRTC_SAMPLE_RATE * WEBRTC_FRAME_DURATION)
-                chunk = np.zeros(silence_samples, dtype = WHISPER_DTYPE)
-            
+                chunk = np.zeros(silence_samples, dtype=WHISPER_DTYPE)
+
             if chunk is None:
                 raise EOFError("End of audio stream")
-            
+
             if not isinstance(chunk, np.ndarray):
-                logger.error(f"session {self.session_id}: Expected numpy error , got {type(chunk)}")
+                logger.error(f"session {self.session_id}: Expected numpy array, got {type(chunk)}")
                 chunk = np.zeros(int(WEBRTC_SAMPLE_RATE * WEBRTC_FRAME_DURATION), dtype=WHISPER_DTYPE)
 
             if len((chunk.shape)) == 1:
                 chunk = chunk.reshape(-1, 1)
 
-            audio_data =  (chunk * (2 ** 15 -1)).astype(np.int16)
+            audio_data = (chunk * (2 ** 15 - 1)).astype(np.int16)
 
-            frame = AudioFrame(format = "s16", layout = "mono", samples = audio_data.shape[0])
+            frame = AudioFrame(format="s16", layout="mono", samples=audio_data.shape[0])
             frame.sample_rate = WEBRTC_SAMPLE_RATE
-
             frame.planes[0].update(audio_data.tobytes())
 
             if self.last_sync_item is None:
@@ -248,8 +429,6 @@ class WebRTCAudioSenderTrack(AudioStreamTrack):
 
             frame.pts = self.sample_sent
             frame.time_base = fractions.Fraction(1, WEBRTC_SAMPLE_RATE)
-
-
             self.sample_sent += audio_data.shape[0]
 
             expected_time = self.sample_sent / WEBRTC_SAMPLE_RATE
@@ -260,36 +439,31 @@ class WebRTCAudioSenderTrack(AudioStreamTrack):
             return frame
 
         except Exception as e:
-            logger.error(f"{self.session_id} error in recv() {e}")
+            logger.exception("%s error in recv()", self.session_id)
             silence_samples = int(WEBRTC_SAMPLE_RATE * WEBRTC_FRAME_DURATION)
-            silence_data = np.zeros(silence_samples, dtype = WHISPER_DTYPE)
-            frame = AudioFrame(format = "s16", layout = "mono", samples = silence_samples)
+            silence_data = np.zeros(silence_samples, dtype=WHISPER_DTYPE)
+            frame = AudioFrame(format="s16", layout="mono", samples=silence_samples)
             frame.sample_rate = WEBRTC_SAMPLE_RATE
             frame.pts = 0
             frame.time_base = fractions.Fraction(1, WEBRTC_SAMPLE_RATE)
             frame.planes[0].update(silence_data.tobytes())
-
             return frame
 
-
-
-# --- LLM Callback ---
+# ---------------- LLM callback endpoint ----------------
 @app.post("/webrtc_server_callback")
 async def webrtc_server_callback(request: Request):
     try:
         data = await request.json()
         session_id = data.get("session_id")
         llm_response_text = data.get("response", "No response")
-        final_transcription = data.get("final_transcription", "")
         if session_id in pcs_by_id:
             tts_queue.put({"session_id": session_id, "text": llm_response_text})
         return {"status": "received"}
     except Exception as e:
-        logger.error(f"Callback error: {e}")
+        logger.exception("Callback error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# --- SDP / ICE ---
+# ---------------- SDP / ICE helpers ----------------
 def parse_sdp_candidate(sdp: str) -> dict:
     parts = sdp.split()
     foundation = parts[0].split(":")[1]
@@ -310,7 +484,6 @@ def parse_sdp_candidate(sdp: str) -> dict:
         elif parts[i] == "tcptype":
             cand["tcpType"] = parts[i + 1]
     return cand
-
 
 @app.post("/candidate/{session_id}")
 async def candidate_from_browser(session_id: str, candidate_json: RTCIceCandidateJSON):
@@ -335,8 +508,7 @@ async def candidate_from_browser(session_id: str, candidate_json: RTCIceCandidat
     await pc.addIceCandidate(cand)
     return {"status": "ok"}
 
-
-# --- Offer ---
+# ---------------- Offer / PeerConnection handling ----------------
 @app.post("/offer")
 async def offer(offer: Offer):
     session_id = str(uuid.uuid4())
@@ -370,26 +542,29 @@ async def offer(offer: Offer):
     @pc.on("connectionstatechange")
     async def on_state_change():
         if pc.connectionState in ("failed", "closed"):
+            logger.info(f"Server: Connection state changed to {pc.connectionState} for session {session_id}. Finalizing session.")
+            # finalize and upload final file
+            recording_manager.finalize_and_upload_on_close(session_id)
+
+            # cleanup
             pcs.discard(pc)
             pcs_by_id.pop(session_id, None)
             pc_outbound_send_ttrack.pop(session_id, None)
-            tts_engines.pop(session_id, None)
             audio_output_queues.pop(session_id, None)
             audio_buffers.pop(session_id, None)
-            current_wav_file[session_id].close()
-            del current_wav_file[session_id]
             silent_chunk_counts.pop(session_id, None)
+            server_ice_candidates.pop(session_id, None)
             logger.info(f"Server: Session {session_id} closed and resources cleared.")
 
     await pc.setRemoteDescription(RTCSessionDescription(sdp=offer.sdp, type=offer.type))
     pc.addTrack(WebRTCAudioSenderTrack(session_id))
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-    sdp_lines = pc.localDescription.sdp.split('\n');
+    sdp_lines = pc.localDescription.sdp.split('\n')
     ice_candidate_in_sdp = [line for line in sdp_lines if line.startswith('a=candidate')]
 
     for candidate_line in ice_candidate_in_sdp:
-        candidate_string = candidate_line[2:].replace('\r','').strip()
+        candidate_string = candidate_line[2:].replace('\r', '').strip()
         candidate_data = {
             "candidate": candidate_string,
             "sdpMid": "0",
@@ -397,7 +572,7 @@ async def offer(offer: Offer):
             "usernameFragment": None
         }
         server_ice_candidates[session_id].append(candidate_data)
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.2)
     return {
         "sdp": pc.localDescription.sdp,
         "type": pc.localDescription.type,
@@ -405,126 +580,77 @@ async def offer(offer: Offer):
         "server_ice_candidates": server_ice_candidates[session_id],
     }
 
-def convert_48khz_audio_to_16khz(samples_48k: np.ndarray) -> np.ndarray:
-    if samples_48k.ndim > 1:
-        samples_48k = samples_48k.mean(axis=-1)
-    samples_16k_float = samples_48k[::3]
-
-    #convert to int16
-    samples_16k_float = np.clip(samples_16k_float, -1.0, 1.0)
-    samples_16k_int16 = (samples_16k_float * 32767.0).astype(np.int16)
-    return samples_16k_int16
-
-def create_new_wav_file(session_id)->str:
-    recordin_dir = "recordings"
-    if not os.path.exists(recordin_dir):
-        os.makedirs(recordin_dir)
-    filename = f"{recordin_dir}/rc_{session_id}.wav"
-    try:
-        if session_id in current_wav_file:
-            current_wav_file[session_id].close()
-        wf = wave.open(filename,'wb')
-        wf.setnchannels(WHISPER_CHANNELS)
-        wf.setsampwidth(2)
-        wf.setframerate(WHISPER_SAMPLE_RATE)
-        current_wav_file[session_id] = wf
-        logger.info(f"Created new wav file for {session_id}")
-        return filename
-    except Exception as e:
-        logger.error(f"Error creating new wav file for {session_id}: {e}")
-        return None
-
-def write_audio_to_current_file(session_id: str, audio_samples:np.ndarray, original_sample_rate: int = WEBRTC_SAMPLE_RATE):
-    if session_id not in current_wav_file:
-        return
-    try:
-        if audio_samples.dtype in (np.float32, np.float64):
-            audio_samples = np.clip(audio_samples, -1.0, 1.0)
-            audio_16k = (audio_samples * 32767.0).astype(np.int16)
-        else:
-            audio_16k = audio_samples.astype(np.int16)
-
-        current_wav_file[session_id].writeframes(audio_16k.tobytes())
-    except Exception as e:
-        logger.error(f"write audio file error {session_id}: {e}")
-
-# --- Audio Processing (incoming) ---
+# ---------------- Audio processing (incoming) ----------------
 async def process_webrtc_audio(session_id: str, track: AudioStreamTrack):
+    """
+    Receives frames from the browser. For each 20ms frame:
+      - compute RMS
+      - if speech: convert to 16k int16 and write to current wav (RecordingManager)
+      - if silence: increment silent counter and if >= threshold, ask RecordingManager to rotate/upload
+    """
     try:
-        # Create new wav file for this session at the start
-        create_new_wav_file(session_id)
+        # ensure a file exists for this session
+        recording_manager.ensure_session(session_id)
 
         while True:
-            frame = await track.recv()
+            frame = await track.recv()  # av.AudioFrame
             raw = frame.to_ndarray()
+            # If stereo, collapse to mono
             if raw.ndim > 1:
                 raw = raw.mean(axis=0)
+            # Normalize to float32 in [-1,1]
             samples = raw.astype(np.float32) / 32768.0
-
+            # compute RMS
             rms = float(np.sqrt(np.mean(samples ** 2)))
+            logger.debug("session %s: rms=%.6f", session_id, rms)
+
             if rms >= SILENCE_THRESHOLD_RMS:
+                # speech
+                recording_manager.mark_speech(session_id)
+                # convert to 16k int16 and write
                 if frame.sample_rate == WEBRTC_SAMPLE_RATE:
-                    audio_16k = convert_48khz_audio_to_16khz(samples)
+                    audio_int16 = convert_48khz_audio_to_16khz(samples)
                 else:
+                    # frame at some other rate (e.g., already 16k)
                     if samples.dtype in (np.float32, np.float64):
-                        samples = np.clip(samples, -1.0, 1.0)
-                        audio_16k = (samples * 32767.0).astype(np.int16)
+                        audio_int16 = float_samples_to_int16(samples)
                     else:
-                        audio_16k = samples.astype(np.int16)
-
-                # ✅ Append audio to the current wav file
-                write_audio_to_current_file(session_id, audio_16k, frame.sample_rate)
-
-                # Send chunk to main server
-                files = {'chunk': ("audio.wav", audio_16k.tobytes(), "audio/wav")}
-                data = {'session_id': session_id}
-                try:
-                    # response = requests.post(
-                    #     f"{MAIN_FASTAPI_SERVER_URL}/stream_audio",
-                    #     files=files,
-                    #     data=data,
-                    #     timeout=3,
-                    # )
-                    print(f"Server: Sent processed chunk for session {session_id}. Response: {''}")
-                except requests.exceptions.ConnectionError as e:
-                    print(f"Server: Could not connect to /stream_audio endpoint: {e}")
-
+                        audio_int16 = samples.astype(np.int16)
+                recording_manager.write_samples(session_id, audio_int16)
             else:
-                silent_chunk_counts[session_id] += 1
-                if silent_chunk_counts[session_id] >= CONSECUTIVE_SILENT_CHUNKS:
-                    silent_chunk_counts[session_id] = 0
-                    data = {
-                        "session_id": session_id,
-                        "callback_url": f"http://localhost:{WEBRTC_SERVER_PORT}/webrtc_server_callback",
-                    }
-                    # await asyncio.to_thread(
-                    #     requests.post,
-                    #     f"{MAIN_FASTAPI_SERVER_URL}/commit_audio",
-                    #     data=data,
-                    #     timeout=3,
-                    # )
-    except Exception as e:
-        logger.error(f"Audio error: {e}")
-    finally:
-        # ✅ Close wav file when track ends
-        if session_id in current_wav_file:
-            try:
-                current_wav_file[session_id].close()
-                logger.info(f"WAV file closed for session {session_id}")
-            except Exception as e:
-                logger.error(f"Error closing WAV file for {session_id}: {e}")
-            del current_wav_file[session_id]
+                # silence
+                rotated = recording_manager.mark_silence_and_maybe_rotate(session_id)
+                if rotated:
+                    # if rotated, silent counter already reset inside manager
+                    logger.info("session %s: rotated file due to prolonged silence", session_id)
+                else:
+                    # no rotation: continue (maybe file was <2s)
+                    pass
 
-# --- Shutdown ---
+    except Exception:
+        logger.exception("Audio processing error for session %s", session_id)
+    finally:
+        # When track ends: finalize
+        try:
+            logger.info("process_webrtc_audio: track ended for %s, finalizing.", session_id)
+            recording_manager.finalize_and_upload_on_close(session_id)
+        except Exception:
+            logger.exception("Error finalizing on track end for %s", session_id)
+
+# ---------------- Shutdown ----------------
 @app.on_event("shutdown")
 async def shutdown_event():
-    for pc in pcs:
-        await pc.close()
+    logger.info("Shutdown event: closing peer connections and TTS worker.")
+    for pc in list(pcs):
+        try:
+            await pc.close()
+        except Exception:
+            logger.exception("Error closing pc")
+    # shutdown tts worker
     tts_queue.put(None)
     tts_worker_thread.join(timeout=5)
 
-
+# ---------------- Run server ----------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=WEBRTC_SERVER_PORT)
