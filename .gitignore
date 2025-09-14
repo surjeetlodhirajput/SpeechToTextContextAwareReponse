@@ -1,0 +1,32 @@
+# Python specific
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python/
+env/
+venv/
+*.env
+.vscode/
+
+# Ignore GPT4All model files
+Documents/GPT4All/
+
+# Ignore Faster-Whisper model files (if stored locally outside of a virtual environment, e.g., in a cache directory)
+# For example, if it caches to a specific folder:
+# .cache/faster-whisper/
+
+# Executables
+*.exe  # This line will ignore all .exe files
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# Virtual environment specific (if it's not named 'env' or 'venv')
+pyvenv.cfg
