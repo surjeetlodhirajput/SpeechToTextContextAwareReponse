@@ -1,34 +1,33 @@
 # 🎙️ SpeechToText Context-Aware Response System
+[designed for customer support scenarios. This system combines WebRTC audio streaming, Faster-Whisper STT, and GPT4All to create intelligent, context-aware voice interactions with complete offline operation for maximum privacy.[4][5]]
 
-[![Python](https://img.shields.iops://img.shields.io/badge/FastAPI-0.116%2B-009://img.shields.ps://img.shields.io/badge/License-MIT-green/badge/Forks-Welcome-brightgreen.peechToTextContextAwareResponse/ assistant** designed for customer support scenarios. This system combines **WebRTC audio streaming**, **Faster-Whisper STT**, and **GPT4All** to create intelligent, context-aware voice interactions with **complete offline operation** for maximum privacy.[4][5]
-
-> **🎯 Perfect for:** Customer support, travel assistants, accessibility tools, voice-controlled interfaces, call center automation, and educational applications.
+> 🎯 Perfect for: Customer support, travel assistants, accessibility tools, voice-controlled interfaces, call center automation, and educational applications.
 
 ## ✨ Key Features
 
-### 🚀 **Real-Time Performance**
-- **WebRTC-based audio streaming** with professional-grade latency (<500ms end-to-end)
-- **Advanced Voice Activity Detection (VAD)** with intelligent silence detection
-- **Multi-session support** with conversation history and context preservation
-- **Automatic audio segmentation** with smart file rotation
+### 🚀 Real-Time Performance
+- WebRTC-based audio streaming with professional-grade latency (<500ms end-to-end)
+- Advanced Voice Activity Detection (VAD) with intelligent silence detection
+- Multi-session support with conversation history and context preservation
+- Automatic audio segmentation with smart file rotation
 
-### 🤖 **Offline AI Processing**
-- **Faster-Whisper** for accurate speech-to-text transcription (95%+ accuracy)
-- **GPT4All** for local language model processing (no external API calls)
-- **Context-aware responses** using predefined knowledge datasets
-- **Privacy-first design** - all processing happens locally
+### 🤖 Offline AI Processing
+- Faster-Whisper for accurate speech-to-text transcription (95%+ accuracy)
+- GPT4All for local language model processing (no external API calls)
+- Context-aware responses using predefined knowledge datasets
+- Privacy-first design - all processing happens locally
 
-### 🎚️ **Professional Audio Pipeline**
-- **48kHz → 16kHz** sample rate conversion with anti-aliasing
-- **Noise reduction and RMS-based VAD** for clean audio processing
-- **Bi-directional TTS** with pyttsx3 for natural voice responses
-- **Multi-format audio support** (WAV, raw PCM, various bit depths)
+### 🎚️ Professional Audio Pipeline
+- 48kHz → 16kHz sample rate conversion with anti-aliasing
+- Noise reduction and RMS-based VAD for clean audio processing
+- Bi-directional TTS with pyttsx3 for natural voice responses
+- Multi-format audio support (WAV, raw PCM, various bit depths)
 
-### ⚡ **Enterprise-Grade Architecture**
-- **Dual-server architecture** for optimized performance
-- **Asynchronous processing** with dedicated worker threads
-- **Session management** with thread-safe operations
-- **Automatic cleanup** and resource management
+### ⚡ Enterprise-Grade Architecture
+- Dual-server architecture for optimized performance
+- Asynchronous processing with dedicated worker threads
+- Session management with thread-safe operations
+- Automatic cleanup and resource management
 
 ## 🏗️ System Architecture
 
@@ -72,9 +71,20 @@
 - Modern browser with WebRTC support
 ```
 
+### Suggestion
+
+## ⚡ GPU Acceleration for Faster Performance
+
+For significantly faster processing, you can enable GPU acceleration for both AI models:
+
+### 🎯 Faster-Whisper GPU Support
+
+GPU acceleration can provide 4-12x faster transcription compared to CPU-only processing. [6][12]
+
+
 ### Installation
 
-1. **Clone and Setup**
+1. Clone and Setup
    ```bash
    git clone https://github.com/your-username/SpeechToTextContextAwareResponse.git
    cd SpeechToTextContextAwareResponse
@@ -84,12 +94,12 @@
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
-2. **Install Dependencies**
+2. Install Dependencies
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Launch the System**
+3. Launch the System
    ```bash
    # Terminal 1: Start Main AI Server
    python main.py
@@ -98,7 +108,7 @@
    python web_rtc.py
    ```
 
-4. **Connect to the Application**
+4. Connect to the Application
    - Open `index.html` in a modern browser
    - Grant microphone permissions
    - Start speaking to interact with the AI assistant
@@ -118,9 +128,9 @@ SpeechToTextContextAwareResponse/
 
 ## ⚙️ Configuration & Customization
 
-### 🎯 **Domain-Specific Customization**
+### 🎯 Domain-Specific Customization
 
-The system is designed for **easy customization**. The current implementation focuses on **travel customer support**, but you can easily adapt it for your specific use case:
+The system is designed for easy customization. The current implementation focuses on travel customer support, but you can easily adapt it for your specific use case:
 
 ```python
 # main.py - Customize your dataset
@@ -142,7 +152,7 @@ def build_system_prompt(your_data):
     """
 ```
 
-### 🔧 **Audio Processing Configuration**
+### 🔧 Audio Processing Configuration
 
 ```python
 # web_rtc.py - Fine-tune audio settings
@@ -151,7 +161,7 @@ MIN_UPLOAD_SECONDS = 2.0           # Minimum audio segment length
 CONSECUTIVE_SILENT_FRAMES = 250    # Silence frames before processing
 ```
 
-### 🤖 **AI Model Configuration**
+### 🤖 AI Model Configuration
 
 ```python
 # main.py - Customize AI models
@@ -162,38 +172,38 @@ TARGET_SAMPLE_RATE = 16000         # Optimal for Whisper
 
 ## 🔀 Fork & Customize for Your Needs
 
-This project is designed to be **easily forkable and customizable** for various domains and use cases:[6][4]
+This project is designed to be easily forkable and customizable for various domains and use cases:[6][4]
 
-### 🍴 **How to Fork**
+### 🍴 How to Fork
 
-1. **Fork this repository** by clicking the "Fork" button on GitHub
-2. **Clone your fork:**
+1. Fork this repository by clicking the "Fork" button on GitHub
+2. Clone your fork:
    ```bash
    git clone https://github.com/YOUR_USERNAME/SpeechToTextContextAwareResponse.git
    ```
 
-### 🎨 **Popular Customization Examples**
+### 🎨 Popular Customization Examples
 
 | Use Case | What to Modify | Files to Edit |
 |----------|---------------|---------------|
-| **Medical Assistant** | Replace travel data with medical knowledge | `main.py` - Update dataset & prompts |
-| **E-commerce Support** | Add product catalogs and order info | `main.py` - Customize TRAVEL_DATA |
-| **Educational Tutor** | Include curriculum and Q&A pairs | `main.py` - Update system prompts |
-| **Smart Home Control** | Add device commands and IoT integration | `main.py` + add IoT controllers |
-| **Legal Assistant** | Include legal documents and case law | `main.py` - Add legal knowledge base |
-| **HR Assistant** | Company policies and employee info | `main.py` - HR-specific dataset |
+| Medical Assistant | Replace travel data with medical knowledge | `main.py` - Update dataset & prompts |
+| E-commerce Support | Add product catalogs and order info | `main.py` - Customize TRAVEL_DATA |
+| Educational Tutor | Include curriculum and Q&A pairs | `main.py` - Update system prompts |
+| Smart Home Control | Add device commands and IoT integration | `main.py` + add IoT controllers |
+| Legal Assistant | Include legal documents and case law | `main.py` - Add legal knowledge base |
+| HR Assistant | Company policies and employee info | `main.py` - HR-specific dataset |
 
-### 🛠️ **Customization Checklist**
+### 🛠️ Customization Checklist
 
-- [ ] **Update dataset** in `main.py` (replace `TRAVEL_DATA`)
-- [ ] **Modify system prompts** for your domain expertise
-- [ ] **Adjust audio processing** parameters in `web_rtc.py`
-- [ ] **Customize web interface** in `index.html`
-- [ ] **Add domain-specific APIs** if needed
-- [ ] **Update README** with your specific use case
-- [ ] **Test with domain-specific queries**
+- [ ] Update dataset in `main.py` (replace `TRAVEL_DATA`)
+- [ ] Modify system prompts for your domain expertise
+- [ ] Adjust audio processing parameters in `web_rtc.py`
+- [ ] Customize web interface in `index.html`
+- [ ] Add domain-specific APIs if needed
+- [ ] Update README with your specific use case
+- [ ] Test with domain-specific queries
 
-### 🌐 **Multi-Language Support**
+### 🌐 Multi-Language Support
 
 ```python
 # Easy language customization
@@ -229,7 +239,7 @@ LANGUAGE_CONFIG = {
 <details>
 <summary><strong>🔍 Common Issues & Solutions</strong></summary>
 
-### **Issue: Empty Whisper transcriptions**
+### Issue: Empty Whisper transcriptions
 ```bash
 # Check audio format and volume
 - Ensure microphone permissions granted
@@ -238,7 +248,7 @@ LANGUAGE_CONFIG = {
 - Validate WAV file format (16kHz, mono, 16-bit)
 ```
 
-### **Issue: WebRTC connection fails**
+### Issue: WebRTC connection fails
 ```bash
 # Network and browser issues
 - Check ports 8000 and 8001 accessibility
@@ -247,7 +257,7 @@ LANGUAGE_CONFIG = {
 - Check firewall settings
 ```
 
-### **Issue: High memory usage**
+### Issue: High memory usage
 ```bash
 # Optimize model settings
 - Use smaller Whisper model: "base" or "small"
@@ -256,7 +266,7 @@ LANGUAGE_CONFIG = {
 - Restart servers periodically
 ```
 
-### **Issue: Audio quality problems**
+### Issue: Audio quality problems
 ```bash
 # Audio pipeline optimization
 - Adjust SILENCE_THRESHOLD_RMS
@@ -272,16 +282,16 @@ LANGUAGE_CONFIG = {
 We welcome contributions! Here's how you can help:[5][7]
 
 
-### **Contributing Guidelines**
+### Contributing Guidelines
 
-1. **Fork the repository**
-2. **Create a feature branch** (`git checkout -b feature/amazing-feature`)
-3. **Make your changes** with clear commit messages
-4. **Add tests** for new functionality
-5. **Update documentation** as needed
-6. **Submit a Pull Request** with detailed description
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes with clear commit messages
+4. Add tests for new functionality
+5. Update documentation as needed
+6. Submit a Pull Request with detailed description
 
-### **Areas for Contribution**
+### Areas for Contribution
 
 - [ ] Additional language model support
 - [ ] WebSocket implementation for lower latency
@@ -293,32 +303,32 @@ We welcome contributions! Here's how you can help:[5][7]
 
 ## 📈 Roadmap
 
-- [ ] **v2.0**: Multi-language support with automatic detection
-- [ ] **v2.1**: WebSocket streaming for ultra-low latency
-- [ ] **v2.2**: Mobile SDK (iOS/Android)
-- [ ] **v2.3**: Docker & Kubernetes deployment
-- [ ] **v2.4**: Custom wake word training
-- [ ] **v2.5**: Voice cloning capabilities
-- [ ] **v3.0**: Distributed processing architecture
+- [ ] v2.0: Multi-language support with automatic detection
+- [ ] v2.1: WebSocket streaming for ultra-low latency
+- [ ] v2.2: Mobile SDK (iOS/Android)
+- [ ] v2.3: Docker & Kubernetes deployment
+- [ ] v2.4: Custom wake word training
+- [ ] v2.5: Voice cloning capabilities
+- [ ] v3.0: Distributed processing architecture
 
 ## 🛡️ Security & Privacy
 
-- **🔒 Complete offline operation** - no external API calls
-- **🏠 Local processing** - all data stays on your infrastructure  
-- **🧹 Automatic cleanup** - temporary files deleted after processing
-- **🔐 Session isolation** - each conversation is completely separated
-- **💾 No data persistence** - conversations not stored by default
+- 🔒 Complete offline operation - no external API calls
+- 🏠 Local processing - all data stays on your infrastructure  
+- 🧹 Automatic cleanup - temporary files deleted after processing
+- 🔐 Session isolation - each conversation is completely separated
+- 💾 No data persistence - conversations not stored by default
 
 ## 📄 License
 
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
-- **[Faster-Whisper](https://github.com/SYSTRAN/faster-whisper)** for efficient speech recognition
-- **[GPT4All](https://gpt4all.io/)** for local language model processing
-- **[aiortc](https://github.com/aiortc/aiortc)** for Python WebRTC implementation
-- **[FastAPI](https://fastapi.tiangolo.com/)** for modern web framework
+- [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) for efficient speech recognition
+- [GPT4All](https://gpt4all.io/) for local language model processing
+- [aiortc](https://github.com/aiortc/aiortc) for Python WebRTC implementation
+- [FastAPI](https://fastapi.tiangolo.com/) for modern web framework
 
 ## 🌟 Star History & Usage
 
@@ -326,10 +336,10 @@ If you find this project helpful, please consider giving it a ⭐ star on GitHub
 
 <div align="center">
 
-**🚀 Fork this project and create your own AI voice assistant! 🚀**
+🚀 Fork this project and create your own AI voice assistant! 🚀
 
 [⭐ Star this repository](https://github.com/your-username/SpeechToTextContextAwareResponse) -  [🍴 Fork & Customize](https://github.com/your-username/SpeechToTextContextAwareResponse/fork) -  [🐛 Report Issues](https://github.com/your-username/SpeechToTextContextAwareResponse/issues) -  [💡 Suggest Features](https://github.com/your-username/SpeechToTextContextAwareResponse/issues/new)
 
-**Built with ❤️ for developers who value privacy and customization**
+Built with ❤️ for developers who value privacy and customization
 
 </div>
