@@ -443,10 +443,6 @@ def write_audio_to_current_file(session_id: str, audio_samples:np.ndarray, origi
             audio_16k = (audio_samples * 32767.0).astype(np.int16)
         else:
             audio_16k = audio_samples.astype(np.int16)
-        
-        # Ensure audio is 16kHz before writing
-        if original_sample_rate != WHISPER_SAMPLE_RATE:
-            audio_16k = resample(audio_16k, int(len(audio_16k) * WHISPER_SAMPLE_RATE / original_sample_rate)).astype(np.int16)
 
         current_wav_file[session_id].writeframes(audio_16k.tobytes())
     except Exception as e:
