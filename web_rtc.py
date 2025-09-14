@@ -15,7 +15,7 @@ import pyttsx3
 import requests
 from typing import Dict, List
 from av import AudioFrame
-from aiortc import RTCPeerConnection, RTCSessionDescription, AudioStreamTrack, RTCIceCandidate
+from aiortc import RTCPeerConnection, RTCSessionDescription, AudioStreamTrack, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -43,7 +43,7 @@ pc_outbound_send_ttrack: Dict[str, "OutboundAudioTrack"] = {}
 audio_buffers: Dict[str, bytearray] = {}
 silent_chunk_counts: Dict[str, int] = {}
 server_ice_candidates: Dict[str, List["RTCIceCandidateJSON"]] = {}
-
+current_wav_file: Dict[str, wave.Wave_write] = {}
 # Audio config
 WHISPER_SAMPLE_RATE = 16000
 WHISPER_CHANNELS = 1
@@ -55,7 +55,7 @@ WEBRTC_FRAME_DURATION = 0.02 #20 ms frame duration
 
 WEBRTC_AUDIO_CHUNK_SIZE = WHISPER_SAMPLE_RATE // 2
 SILENCE_THRESHOLD_RMS = 0.015
-CONSECUTIVE_SILENT_CHUNKS = 6
+CONSECUTIVE_SILENT_CHUNKS = 3
 FRAME_MS = 20
 FRAME_SIZE = int(WHISPER_SAMPLE_RATE * (FRAME_MS / 1000.0))
 
@@ -340,12 +340,27 @@ async def candidate_from_browser(session_id: str, candidate_json: RTCIceCandidat
 @app.post("/offer")
 async def offer(offer: Offer):
     session_id = str(uuid.uuid4())
-    pc = RTCPeerConnection()
+    pc = RTCPeerConnection(
+        configuration=RTCConfiguration(
+            iceServers=[
+                RTCIceServer(urls=["stun:stun.l.google.com:19302"])
+            ]
+        )
+    )
     pcs.add(pc)
     pcs_by_id[session_id] = pc
     audio_buffers[session_id] = bytearray()
     silent_chunk_counts[session_id] = 0
     server_ice_candidates[session_id] = []
+
+    @pc.on("icecandidate")
+    def on_icecandidate(event):
+        if event.candidate:
+            server_ice_candidates[session_id].append({
+                "candidate": event.candidate.sdp,
+                "sdpMid": event.candidate.sdpMid,
+                "sdpMLineIndex": event.candidate.sdpMLineIndex
+            })
 
     @pc.on("track")
     async def on_track(track):
@@ -358,45 +373,151 @@ async def offer(offer: Offer):
             pcs.discard(pc)
             pcs_by_id.pop(session_id, None)
             pc_outbound_send_ttrack.pop(session_id, None)
+            tts_engines.pop(session_id, None)
+            audio_output_queues.pop(session_id, None)
+            audio_buffers.pop(session_id, None)
+            current_wav_file[session_id].close()
+            del current_wav_file[session_id]
+            silent_chunk_counts.pop(session_id, None)
+            logger.info(f"Server: Session {session_id} closed and resources cleared.")
 
     await pc.setRemoteDescription(RTCSessionDescription(sdp=offer.sdp, type=offer.type))
     pc.addTrack(WebRTCAudioSenderTrack(session_id))
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "session_id": session_id}
+    sdp_lines = pc.localDescription.sdp.split('\n');
+    ice_candidate_in_sdp = [line for line in sdp_lines if line.startswith('a=candidate')]
 
+    for candidate_line in ice_candidate_in_sdp:
+        candidate_string = candidate_line[2:].replace('\r','').strip()
+        candidate_data = {
+            "candidate": candidate_string,
+            "sdpMid": "0",
+            "sdpMLineIndex": 0,
+            "usernameFragment": None
+        }
+        server_ice_candidates[session_id].append(candidate_data)
+    await asyncio.sleep(0.5)
+    return {
+        "sdp": pc.localDescription.sdp,
+        "type": pc.localDescription.type,
+        "session_id": session_id,
+        "server_ice_candidates": server_ice_candidates[session_id],
+    }
+
+def convert_48khz_audio_to_16khz(samples_48k: np.ndarray) -> np.ndarray:
+    if samples_48k.ndim > 1:
+        samples_48k = samples_48k.mean(axis=-1)
+    samples_16k_float = samples_48k[::3]
+
+    #convert to int16
+    samples_16k_float = np.clip(samples_16k_float, -1.0, 1.0)
+    samples_16k_int16 = (samples_16k_float * 32767.0).astype(np.int16)
+    return samples_16k_int16
+
+def create_new_wav_file(session_id)->str:
+    recordin_dir = "recordings"
+    if not os.path.exists(recordin_dir):
+        os.makedirs(recordin_dir)
+    filename = f"{recordin_dir}/rc_{session_id}.wav"
+    try:
+        if session_id in current_wav_file:
+            current_wav_file[session_id].close()
+        wf = wave.open(filename,'wb')
+        wf.setnchannels(WHISPER_CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(WHISPER_SAMPLE_RATE)
+        current_wav_file[session_id] = wf
+        logger.info(f"Created new wav file for {session_id}")
+        return filename
+    except Exception as e:
+        logger.error(f"Error creating new wav file for {session_id}: {e}")
+        return None
+
+def write_audio_to_current_file(session_id: str, audio_samples:np.ndarray, original_sample_rate: int = WEBRTC_SAMPLE_RATE):
+    if session_id not in current_wav_file:
+        return
+    try:
+        if audio_samples.dtype in (np.float32, np.float64):
+            audio_samples = np.clip(audio_samples, -1.0, 1.0)
+            audio_16k = (audio_samples * 32767.0).astype(np.int16)
+        else:
+            audio_16k = audio_samples.astype(np.int16)
+        
+        # Ensure audio is 16kHz before writing
+        if original_sample_rate != WHISPER_SAMPLE_RATE:
+            audio_16k = resample(audio_16k, int(len(audio_16k) * WHISPER_SAMPLE_RATE / original_sample_rate)).astype(np.int16)
+
+        current_wav_file[session_id].writeframes(audio_16k.tobytes())
+    except Exception as e:
+        logger.error(f"write audio file error {session_id}: {e}")
 
 # --- Audio Processing (incoming) ---
 async def process_webrtc_audio(session_id: str, track: AudioStreamTrack):
     try:
+        # Create new wav file for this session at the start
+        create_new_wav_file(session_id)
+
         while True:
             frame = await track.recv()
             raw = frame.to_ndarray()
             if raw.ndim > 1:
                 raw = raw.mean(axis=0)
             samples = raw.astype(np.float32) / 32768.0
-            if frame.sample_rate != WHISPER_SAMPLE_RATE:
-                samples = resample(samples, int(len(samples) * WHISPER_SAMPLE_RATE / frame.sample_rate))
-            rms = float(np.sqrt(np.mean(samples**2)))
-            if rms < SILENCE_THRESHOLD_RMS:
-                silent_chunk_counts[session_id] += 1
+
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            if rms >= SILENCE_THRESHOLD_RMS:
+                if frame.sample_rate == WEBRTC_SAMPLE_RATE:
+                    audio_16k = convert_48khz_audio_to_16khz(samples)
+                else:
+                    if samples.dtype in (np.float32, np.float64):
+                        samples = np.clip(samples, -1.0, 1.0)
+                        audio_16k = (samples * 32767.0).astype(np.int16)
+                    else:
+                        audio_16k = samples.astype(np.int16)
+
+                # ✅ Append audio to the current wav file
+                write_audio_to_current_file(session_id, audio_16k, frame.sample_rate)
+
+                # Send chunk to main server
+                files = {'chunk': ("audio.wav", audio_16k.tobytes(), "audio/wav")}
+                data = {'session_id': session_id}
+                try:
+                    # response = requests.post(
+                    #     f"{MAIN_FASTAPI_SERVER_URL}/stream_audio",
+                    #     files=files,
+                    #     data=data,
+                    #     timeout=3,
+                    # )
+                    print(f"Server: Sent processed chunk for session {session_id}. Response: {''}")
+                except requests.exceptions.ConnectionError as e:
+                    print(f"Server: Could not connect to /stream_audio endpoint: {e}")
+
             else:
-                silent_chunk_counts[session_id] = 0
-            if silent_chunk_counts[session_id] >= CONSECUTIVE_SILENT_CHUNKS:
-                silent_chunk_counts[session_id] = 0
-                data = {
-                    "session_id": session_id,
-                    "callback_url": f"http://localhost:{WEBRTC_SERVER_PORT}/webrtc_server_callback",
-                }
-                await asyncio.to_thread(
-                    requests.post,
-                    f"{MAIN_FASTAPI_SERVER_URL}/commit_audio",
-                    data=data,
-                    timeout=3,
-                )
+                silent_chunk_counts[session_id] += 1
+                if silent_chunk_counts[session_id] >= CONSECUTIVE_SILENT_CHUNKS:
+                    silent_chunk_counts[session_id] = 0
+                    data = {
+                        "session_id": session_id,
+                        "callback_url": f"http://localhost:{WEBRTC_SERVER_PORT}/webrtc_server_callback",
+                    }
+                    # await asyncio.to_thread(
+                    #     requests.post,
+                    #     f"{MAIN_FASTAPI_SERVER_URL}/commit_audio",
+                    #     data=data,
+                    #     timeout=3,
+                    # )
     except Exception as e:
         logger.error(f"Audio error: {e}")
-
+    finally:
+        # ✅ Close wav file when track ends
+        if session_id in current_wav_file:
+            try:
+                current_wav_file[session_id].close()
+                logger.info(f"WAV file closed for session {session_id}")
+            except Exception as e:
+                logger.error(f"Error closing WAV file for {session_id}: {e}")
+            del current_wav_file[session_id]
 
 # --- Shutdown ---
 @app.on_event("shutdown")
