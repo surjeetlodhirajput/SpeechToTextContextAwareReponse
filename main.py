@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Dict, Optional
 import threading
 import queue
+import wave
+import io
 
 import numpy as np
 import uvicorn
@@ -11,12 +13,18 @@ import requests
 from fastapi import FastAPI, UploadFile, Form
 from faster_whisper import WhisperModel
 from gpt4all import GPT4All
+import soundfile as sf
+from scipy.signal import resample
 
 ############################
 # Config
 ############################
-WHISPER_MODEL = "large-v2"  # Recommended for better accuracy
+WHISPER_MODEL = "large-v2"
 GPT4ALL_MODEL = "orca-mini-3b-gguf2-q4_0.gguf"
+
+# Target audio format for Whisper
+TARGET_SAMPLE_RATE = 16000
+TARGET_CHANNELS = 1
 
 # Hardcoded global TRAVEL_DATA
 TRAVEL_DATA = [
@@ -50,9 +58,119 @@ print("Server: Models loaded.")
 sessions: Dict[str, dict] = {}
 
 # Worker queues
-stt_request_queue: "queue.Queue[dict]" = queue.Queue()   # STT (Whisper) queue
-llm_request_queue: "queue.Queue[dict]" = queue.Queue()   # LLM (GPT4All) queue
+stt_request_queue: "queue.Queue[dict]" = queue.Queue()
+llm_request_queue: "queue.Queue[dict]" = queue.Queue()
 
+############################
+# FIXED: Audio Processing Helpers with proper type conversion
+############################
+def convert_numpy_types(obj):
+    """
+    FIXED: Convert numpy types to native Python types for JSON serialization
+    """
+    if isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    else:
+        return obj
+
+def validate_and_convert_audio(audio_bytes: bytes) -> tuple[np.ndarray, dict]:
+    """
+    FIXED: Properly validate and convert WAV files with JSON-serializable output
+    """
+    try:
+        audio_info = {"original_format": "unknown", "channels": 0, "sample_rate": 0, "duration": 0.0}
+        
+        try:
+            # Method 1: Parse WAV file using wave module (handles int16 PCM correctly)
+            with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
+                frames = wf.getnframes()
+                sample_rate = wf.getframerate()
+                channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                
+                audio_info.update({
+                    "original_format": "WAV",
+                    "channels": channels,
+                    "sample_rate": sample_rate,
+                    "duration": frames / sample_rate if sample_rate > 0 else 0.0,
+                    "sample_width": sampwidth
+                })
+                
+                # Read PCM data
+                pcm_data = wf.readframes(frames)
+                
+                # FIXED: Convert based on actual sample width
+                if sampwidth == 1:  # 8-bit unsigned
+                    audio_np = np.frombuffer(pcm_data, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+                elif sampwidth == 2:  # 16-bit signed (most common)
+                    audio_np = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+                elif sampwidth == 4:  # 32-bit signed or float
+                    try:
+                        # Try as float32 first
+                        audio_np = np.frombuffer(pcm_data, dtype=np.float32)
+                        if np.max(np.abs(audio_np)) > 10:  # Likely int32, not float32
+                            audio_np = np.frombuffer(pcm_data, dtype=np.int32).astype(np.float32) / 2147483648.0
+                    except:
+                        audio_np = np.frombuffer(pcm_data, dtype=np.int32).astype(np.float32) / 2147483648.0
+                else:
+                    raise ValueError(f"Unsupported sample width: {sampwidth}")
+                    
+        except wave.Error:
+            # Method 2: Try with soundfile for other formats
+            try:
+                audio_np, sample_rate = sf.read(io.BytesIO(audio_bytes), always_2d=False)
+                
+                audio_info.update({
+                    "original_format": "Other",
+                    "channels": 1 if audio_np.ndim == 1 else audio_np.shape[1],
+                    "sample_rate": sample_rate,
+                    "duration": len(audio_np) / sample_rate if sample_rate > 0 else 0.0
+                })
+                
+                if audio_np.dtype != np.float32:
+                    audio_np = audio_np.astype(np.float32)
+                    
+            except Exception as sf_error:
+                raise ValueError(f"Failed to decode audio: {sf_error}")
+        
+        # Convert stereo to mono if needed
+        if audio_np.ndim > 1:
+            if audio_np.shape[1] == 2:  # Stereo
+                audio_np = np.mean(audio_np, axis=1)
+            else:  # Multi-channel
+                audio_np = audio_np[:, 0]  # Take first channel
+        
+        # FIXED: Proper resampling to target sample rate
+        if audio_info["sample_rate"] != TARGET_SAMPLE_RATE:
+            target_length = int(len(audio_np) * TARGET_SAMPLE_RATE / audio_info["sample_rate"])
+            audio_np = resample(audio_np, target_length)
+            print(f"Resampled audio from {audio_info['sample_rate']}Hz to {TARGET_SAMPLE_RATE}Hz")
+        
+        # Ensure audio is in correct range [-1.0, 1.0]
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+        
+        # FIXED: Check for silent audio and convert to native Python float
+        rms = np.sqrt(np.mean(audio_np ** 2))
+        audio_info["rms_level"] = float(rms)  # Convert numpy.float32 to Python float
+        
+        if audio_info["rms_level"] < 0.001:
+            print(f"Warning: Audio RMS level is very low ({audio_info['rms_level']:.6f}). Audio might be silent.")
+        
+        # FIXED: Convert all numpy types in audio_info to Python types
+        audio_info = convert_numpy_types(audio_info)
+        
+        return audio_np, audio_info
+        
+    except Exception as e:
+        raise ValueError(f"Audio conversion failed: {e}")
 
 ############################
 # Helpers
@@ -70,10 +188,9 @@ def get_session(session_id: str):
         }
     return sessions[session_id]
 
-
 def build_system_prompt(travel_data) -> str:
     """Builds the full system prompt with formatted travel dataset."""
-
+    
     def format_entry(entry: dict, idx: int) -> str:
         return f"  - Travel Option {idx}: " + ", ".join(f"{k}: {v}" for k, v in entry.items())
 
@@ -88,7 +205,7 @@ def build_system_prompt(travel_data) -> str:
 You are a customer support assistant.
 You must ONLY use the travel dataset below to answer.
 If the user asks something outside the dataset, reply with:
-"I don’t have that information."
+"I don't have that information."
 Keep answers short and clear.
 
 Dataset:
@@ -97,13 +214,11 @@ Dataset:
 Given the dataset above, answer the user's question strictly using only that information.
 """
 
-
-
 ############################
-# Worker threads
+# FIXED Worker threads
 ############################
 def stt_worker():
-    """Dedicated worker to run Whisper transcription off the FastAPI loop."""
+    """FIXED: Dedicated worker with proper audio format handling for Whisper."""
     print("Server: STT worker thread started.")
     while True:
         task = stt_request_queue.get()
@@ -117,25 +232,51 @@ def stt_worker():
 
         transcription = ""
         try:
-            audio_np = np.frombuffer(audio_bytes, dtype=np.float32)
-            segments, _ = whisper_model.transcribe(
-                audio_np,
-                word_timestamps=True,
-                language="en",
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
-            )
-            transcription = " ".join(s.text.strip() for s in segments)
-            print(f"Server: STT worker - Session {session_id} - Transcription: {transcription}")
+            print(f"Server: STT worker - Session {session_id} - Processing {len(audio_bytes)} bytes of audio")
+            
+            # FIXED: Proper audio conversion
+            audio_np, audio_info = validate_and_convert_audio(audio_bytes)
+            
+            print(f"Server: STT worker - Audio info: {audio_info}")
+            
+            # Check if audio has meaningful content
+            if audio_info["duration"] < 0.1:
+                print(f"Server: STT worker - Audio too short ({audio_info['duration']:.2f}s)")
+                transcription = ""
+            elif audio_info["rms_level"] < 0.001:
+                print(f"Server: STT worker - Audio too quiet (RMS: {audio_info['rms_level']:.6f})")
+                transcription = ""
+            else:
+                # Run Whisper transcription with optimized parameters
+                print(f"Server: STT worker - Running Whisper on {len(audio_np)} samples")
+                segments, info = whisper_model.transcribe(
+                    audio_np,
+                    word_timestamps=True,
+                    language="en",
+                    vad_filter=True,
+                    vad_parameters=dict(
+                        min_silence_duration_ms=500,
+                        min_speech_duration_ms=250
+                    ),
+                    beam_size=5,
+                    temperature=0.0
+                )
+                
+                transcription = " ".join(s.text.strip() for s in segments)
+                print(f"Server: STT worker - Session {session_id} - Transcription: '{transcription}'")
+                print(f"Server: STT worker - Language: {info.language} (confidence: {info.language_probability:.2f})")
+                
         except Exception as e:
             print(f"Server: STT worker - Error during Whisper transcription: {e}")
+            import traceback
+            traceback.print_exc()
             transcription = ""
 
         if not transcription.strip():
             # Send immediate callback with "didn't catch that"
             payload = {
                 "final_transcription": "",
-                "response": "Sorry, I didn’t catch that.",
+                "response": "Sorry, I didn't catch that.",
                 "session_id": session_id,
             }
             if callback_url:
@@ -154,7 +295,6 @@ def stt_worker():
             "callback_url": callback_url
         })
         stt_request_queue.task_done()
-
 
 def llm_worker():
     """Dedicated worker to process LLM requests (single-threaded for GPT4All safety)."""
@@ -186,8 +326,10 @@ def llm_worker():
                     print(f"Server: LLM worker - Failed to send error callback: {e}")
             llm_request_queue.task_done()
             continue
+            
         full_system_prompt = build_system_prompt(TRAVEL_DATA)
-        print(f"Server: LLM worker - Session {session_id} prompt-{full_system_prompt} - Generating response for: '{transcription}'")
+        print(f"Server: LLM worker - Session {session_id} - Generating response for: '{transcription}'")
+        
         try:
             with gpt4all_model.chat_session(full_system_prompt):
                 response_text = gpt4all_model.generate(
@@ -223,22 +365,91 @@ def llm_worker():
 
         llm_request_queue.task_done()
 
+# endpoint to handle the file upload
+from fastapi import File
 
-############################
-# API Endpoints
-############################
+@app.post("/upload_wav")
+async def upload_wav(
+    session_id: str = Form(...),
+    callback_url: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """
+    FIXED: Accept a WAV file with proper validation and JSON-serializable responses
+    """
+    session = get_session(session_id)
+    audio_bytes = await file.read()
+
+    print(f"Server: upload_wav - Session {session_id} - Received file: {file.filename} ({len(audio_bytes)} bytes)")
+
+    if not audio_bytes:
+        payload = {
+            "final_transcription": "",
+            "response": "Sorry, I didn't catch that (empty WAV).",
+            "session_id": session_id,
+        }
+        try:
+            requests.post(callback_url, json=payload, timeout=5)
+            print(f"Server: upload_wav - Empty file, sent default response to {callback_url}")
+        except requests.exceptions.RequestException as e:
+            print(f"Server: upload_wav - Callback error: {e}")
+        return {"message": "Uploaded file was empty.", "session_id": session_id}
+
+    # ADDED: Quick validation before queuing
+    try:
+        audio_np, audio_info = validate_and_convert_audio(audio_bytes)
+        print(f"Server: upload_wav - Audio validation successful: {audio_info}")
+        
+        if audio_info["duration"] < 0.1:
+            payload = {
+                "final_transcription": "",
+                "response": "Sorry, the audio was too short.",
+                "session_id": session_id,
+            }
+            try:
+                requests.post(callback_url, json=payload, timeout=5)
+            except requests.exceptions.RequestException as e:
+                print(f"Server: upload_wav - Callback error: {e}")
+            return {"message": "Audio too short.", "session_id": session_id}
+            
+    except Exception as e:
+        print(f"Server: upload_wav - Audio validation failed: {e}")
+        payload = {
+            "final_transcription": "",
+            "response": "Sorry, there was an issue with the audio format.",
+            "session_id": session_id,
+        }
+        try:
+            requests.post(callback_url, json=payload, timeout=5)
+        except requests.exceptions.RequestException as e:
+            print(f"Server: upload_wav - Callback error: {e}")
+        return {"message": "Audio validation failed.", "session_id": session_id}
+
+    # Queue it for STT → LLM pipeline
+    stt_request_queue.put({
+        "session_id": session_id,
+        "audio_bytes": audio_bytes,
+        "callback_url": callback_url
+    })
+    print(f"Server: upload_wav - Session {session_id} - Queued WAV for STT processing.")
+
+    # FIXED: Return JSON-serializable response (audio_info already converted)
+    return {
+        "message": "WAV file accepted and validated. Transcription + response will be sent to callback URL.",
+        "session_id": session_id,
+        "audio_info": audio_info  # Now contains only Python native types
+    }
+
+# Rest of the endpoints remain the same...
 @app.post("/stream_audio")
 async def stream_audio(
     session_id: str = Form(...),
     chunk: UploadFile = Form(...),
 ):
-    """
-    Accept incoming audio chunks and buffer them without blocking.
-    """
+    """Accept incoming audio chunks and buffer them without blocking."""
     session = get_session(session_id)
     data = await chunk.read()
 
-    # Lock to avoid race with commit that snapshots & clears buffer
     with session["lock"]:
         session["audio_buffer"].extend(data)
         session["last_chunk_time"] = time.time()
@@ -246,36 +457,20 @@ async def stream_audio(
     print(f"Server: Session {session_id} - Audio buffer size: {len(session['audio_buffer'])} bytes")
     return {"message": "Listening...", "session_id": session_id}
 
-
 @app.post("/commit_audio")
 async def commit_audio(session_id: str = Form(...), callback_url: str = Form(...)):
-    """
-    Snapshot the buffered audio and queue it for STT in a background thread.
-    Return immediately so audio streaming isn't blocked.
-    """
+    """Snapshot the buffered audio and queue it for STT in a background thread."""
     session = get_session(session_id)
 
-    # Snapshot & clear buffer atomically
     with session["lock"]:
         if len(session["audio_buffer"]) == 0:
-            # Nothing to transcribe; send immediate callback
-            payload = {
-                "final_transcription": "",
-                "response": "Sorry, I didn’t catch that.",
-                "session_id": session_id
-            }
-            try:
-                requests.post(callback_url, json=payload, timeout=5)
-                print(f"Server: commit_audio - No audio, sent default response to {callback_url}")
-            except requests.exceptions.RequestException as e:
-                print(f"Server: commit_audio - Callback error: {e}")
+            print(f"Server: commit_audio - No audio, skipping for {session_id}")
             return {"message": "No audio to process.", "session_id": session_id}
 
         audio_snapshot = bytes(session["audio_buffer"])
         session["audio_buffer"].clear()
         session["transcription_buffer"] = ""
 
-    # Queue STT work
     stt_request_queue.put({
         "session_id": session_id,
         "audio_bytes": audio_snapshot,
@@ -284,7 +479,6 @@ async def commit_audio(session_id: str = Form(...), callback_url: str = Form(...
     print(f"Server: commit_audio - Session {session_id} - Queued audio ({len(audio_snapshot)} bytes) for STT.")
 
     return {"message": "Audio committed. STT and LLM will run in background; response will be sent to your callback.", "session_id": session_id}
-
 
 @app.post("/start_session")
 def start_session():
@@ -301,19 +495,15 @@ def start_session():
     print(f"Server: New session started: {session_id}")
     return {"session_id": session_id}
 
-
 @app.post("/set_session_context")
 def set_session_context(
     session_id: str = Form(...),
     system_prompt: str = Form(...),
     travel_data: str = Form(...)
 ):
-    """
-    Kept for compatibility; using hardcoded global context instead.
-    """
+    """Kept for compatibility; using hardcoded global context instead."""
     print(f"Server: Received context for session {session_id}; using global context.")
     return {"message": "Session context updated successfully.", "session_id": session_id}
-
 
 @app.post("/end_session")
 def end_session(session_id: str = Form(...)):
@@ -323,7 +513,6 @@ def end_session(session_id: str = Form(...)):
         print(f"Server: Session {session_id} ended.")
         return {"message": "Session ended", "session_id": session_id}
     return {"message": "Session not found", "session_id": session_id}
-
 
 ############################
 # Run
